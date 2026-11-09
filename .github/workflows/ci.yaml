@@ -1,0 +1,105 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - master
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    name: Typecheck, lint, test, build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          # Keep the security floor while automatically adopting later Node 24
+          # patches instead of leaving CI on this release indefinitely.
+          node-version: ">=24.22.1 <25"
+          check-latest: true
+          cache: npm
+      - name: Install dependencies
+        run: npm ci
+      - name: Verify Agent Skill is current
+        run: npm run agent:skill:check
+      - name: Verify pending Changesets
+        run: |
+          pending_changesets="$(git ls-files -- '.changeset/*.md' ':(exclude).changeset/README.md')"
+          if [[ -z "$pending_changesets" ]]; then
+            echo "No pending Changesets to validate."
+            exit 0
+          fi
+
+          # Pull request checkouts do not create a local base branch, but
+          # Changesets resolves `baseBranch: master` through that local ref.
+          if [[ "$GITHUB_EVENT_NAME" == "pull_request" ]]; then
+            git show-ref --verify --quiet refs/heads/master || git branch master origin/master
+          fi
+          npm exec -- changeset status
+      - name: Typecheck
+        run: npm run typecheck
+      - name: Lint
+        run: npm run lint
+      - name: Test
+        run: npm test
+      - name: Verify migration codemod
+        run: npm run verify:codemod
+      - name: Build
+        run: npm run build
+      - name: Verify packed package on patched Node 24
+        run: npm run verify:package
+
+  docs:
+    name: Docs build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ">=24.22.1 <25"
+          check-latest: true
+          cache: npm
+      - name: Install SDK dependencies
+        run: npm ci
+      - name: Install docs dependencies
+        run: npm --prefix docs ci
+      # `prebuild` regenerates the API reference + examples pages, then builds.
+      # `onBrokenLinks: "throw"` makes this fail on any broken link/anchor.
+      - name: Build docs site
+        run: npm --prefix docs run build
+
+  regen-invariant:
+    name: OpenAPI trees reproduce byte-for-byte
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ">=24.22.1 <25"
+          check-latest: true
+          cache: npm
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+          check-latest: true
+      # `generate:offline` runs the SDK safety gate (typecheck/lint/test/docs)
+      # at the end, so the root deps must be installed too — not just tooling.
+      - name: Install SDK dependencies
+        run: npm ci
+      - name: Install tooling dependencies
+        run: npm --prefix tooling ci
+      - name: Regenerate REST trees from pinned specs (offline)
+        run: npm run generate:offline
+      - name: Assert generated trees are unchanged
+        run: git diff --exit-code -- src/trading src/market-data

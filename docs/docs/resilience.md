@@ -1,0 +1,251 @@
+---
+title: Resilience & configuration
+---
+
+# Resilience & configuration
+
+All resilience features are configured on the `Alpaca` client (or a raw
+`Configuration`). The `Alpaca` facade enables the defaults described below.
+Bare generated API clients built from a low-level `Configuration` have retries
+off (`maxRetries: 0`) unless you configure them.
+
+```ts
+const alpaca = new Alpaca({
+  keyId,
+  secret,
+  timeoutMs: 30_000,
+  retry: {
+    maxRetries: 2,
+    retryDelayMs: 250,
+    maxDelayMs: 5_000,
+    retryableStatuses: [408, 425, 429, 500, 502, 503, 504],
+    respectRetryAfter: true,
+  },
+  rateLimit: {
+    maxRequests: 200,
+    intervalMs: 60_000,
+    maxConcurrent: 16,
+  },
+  redirect: "error",
+});
+```
+
+## Retry
+
+On the `Alpaca` client, retry is **on by default** (3 attempts = 1 initial + 2
+retries) with exponential `250ms`..`5s` backoff, `±20%` jitter, and the retryable
+status set `408, 425, 429, 500, 502, 503, 504`. Only safe/idempotent verbs
+(`GET/HEAD/OPTIONS/TRACE`) and transient network failures are retried — a
+non-idempotent `POST`/`PATCH`/etc. is never auto-retried, so an order can't be
+silently replayed by the transport. A `Retry-After` header is honored over the
+computed delay for eligible requests: it replaces the computed backoff, but is
+still capped by `maxDelayMs`.
+
+### Observability
+
+Pass `onRetry` and `onGiveUp` to observe attempts. Each fires with a `RetryEvent`
+(`{ method, url, attempt, maxRetries, delayMs, status?, error? }`): `status` for
+status-based retries, `error` for network-error retries. Exceptions thrown from a
+listener are swallowed so they can never break a request.
+
+```ts
+retry: {
+  maxRetries: 3,
+  onRetry: (e) => console.warn(`retry ${e.attempt}/${e.maxRetries} in ${e.delayMs}ms`),
+  onGiveUp: (e) => console.error(`gave up after ${e.attempt} retries`, e.status ?? e.error),
+}
+```
+
+## Order-submission safety
+
+Give each order a stable, unique `clientOrderId` in its request body. This
+provides an auditable correlation key and a recovery lookup, but it does not
+replay a prior response: Alpaca rejects a duplicate client ID.
+
+```ts
+const clientOrderId = `rebalance-${crypto.randomUUID()}`;
+
+await alpaca.trading.orders.market({
+  symbol: "AAPL",
+  side: "buy",
+  qty: 1,
+  clientOrderId,
+});
+```
+
+Order-placement `POST`s are never auto-retried. If a `FetchError` makes the
+outcome ambiguous, call
+`alpaca.trading.orders.getOrderByClientOrderId({ clientOrderId })` before any
+further submission. A lookup miss is not proof that the placement failed, and
+the SDK does not promise that a record will eventually appear; follow your
+application's reconciliation policy.
+
+`submitAndWait` adds a narrowly scoped workflow: it waits for the server's
+`listening` acknowledgement for `trade_updates`, then issues one placement per
+invocation. It preserves a supplied client ID or creates one once, never
+re-places on stream reconnect, and applies one deadline across connect,
+authentication, subscription, REST placement, and terminal-event waiting.
+After an ambiguous placement `FetchError`, it performs one
+`getOrderByClientOrderId` request and continues waiting when appropriate.
+Generic `market`/`limit`/`submit` calls do not reconcile automatically. A
+timeout can still leave the outcome ambiguous; `submitAndWait` does not promise
+exactly-once execution or eventual lookup visibility. Post-placement workflow
+failures reject with `SubmitAndWaitError`, which exposes `clientOrderId`, an
+optional confirmed `orderId`, `phase`, `placementAmbiguous`, and the original
+`cause`. Reconcile the client ID before resubmitting when placement remains
+ambiguous.
+
+## Timeouts
+
+`timeoutMs` is a fresh **per-attempt** deadline (default 30s; pass `0` to
+disable). Each attempt's budget starts before credential resolution and request
+preparation. It covers asynchronous API-key or OAuth loading, init overrides,
+client-side rate-limit acquisition and waiting, pre middleware, `fetch`,
+error/post middleware, and successful or error response-body consumption.
+
+Retry backoff is outside the finished attempt's budget; the next attempt gets a
+new full deadline. A caller `AbortSignal` spans the whole operation and can
+cancel an active attempt or its retry backoff. Pass it through a generated
+method's `initOverrides`: it follows the request-parameters object when a method
+has one, and is the first argument for parameterless methods:
+
+```ts
+const controller = new AbortController();
+const request = alpaca.trading.orders.getAllOrders(
+  {},
+  { signal: controller.signal },
+);
+
+controller.abort();
+await request;
+```
+
+Cancellation from any phase rejects with `FetchError`. A default abort from
+`controller.abort()` has an `AbortError` cause. A custom reason that is an
+`Error` or `DOMException` remains the cause; primitive custom reasons are
+normalized to an `AbortError` rather than exposed as raw values. An attempt
+deadline has a `TimeoutError` cause. Neither cancellation kind is retried, and
+`POST` remains excluded from automatic retry.
+
+## Redirects
+
+Requests default to `redirect: "error"`, so any `3xx` fails fast instead of being
+followed. Alpaca's APIs never redirect, and following one off-host would forward
+the `APCA-API-*` secret headers to the redirect target (unlike `Authorization`,
+custom headers are not stripped on a cross-origin redirect). Set
+`redirect: "follow"` to opt back into the platform default behind a redirecting
+proxy.
+
+## Rate limiting
+
+The `Alpaca` client enables a safe default token bucket (~200 req/min, applied
+independently to the trading and market-data hosts). Tune it with a `rateLimit`
+config or pass `rateLimit: false` to opt out. Raw API classes created from a
+bare `Configuration` do not enable a limiter unless you configure one.
+
+## Typed errors & response headers
+
+Non-2xx responses reject with a typed `ApiError` (subclasses: `AuthError` 401,
+`PermissionError` 403, `NotFoundError` 404, `ValidationError` 400/422,
+`RateLimitError` 429), each carrying `status`, `code`, `rateLimit`, and
+`requestId`. Handle API responses separately from transport failures:
+
+```ts
+import {
+  ApiError,
+  FetchError,
+  orders,
+} from "@alpacahq/alpaca-trade-api";
+
+const clientOrderId = `resilient-order-${crypto.randomUUID()}`;
+const createOrderRequest = orders.buildMarketOrder({
+  symbol: "AAPL",
+  side: "buy",
+  qty: 1,
+  clientOrderId,
+});
+
+try {
+  await alpaca.trading.orders.postOrder({ createOrderRequest });
+} catch (error) {
+  if (error instanceof ApiError) {
+    console.error({
+      status: error.status,
+      code: error.code,
+      message: error.message,
+      requestId: error.requestId,
+      rateLimit: error.rateLimit,
+    });
+  } else if (error instanceof FetchError) {
+    // DNS, connection, timeout, or cancellation failure; inspect the cause.
+    console.error("transport failed", error.cause);
+    // For a POST order, the outcome may be ambiguous: reconcile the stable
+    // clientOrderId before resubmitting.
+  } else {
+    throw error;
+  }
+}
+```
+
+An `ApiError` proves that Alpaca returned an HTTP response. A `FetchError`
+instead wraps the underlying transport `cause`; for a submitted POST, that
+transport failure can be ambiguous because the server may have accepted the
+request before the response was lost. Reconcile by stable `clientOrderId`
+before resubmitting an order.
+
+For metadata on a **successful** call, wrap the generated `*Raw` method with
+`withResponse`:
+
+```ts
+import { withResponse } from "@alpacahq/alpaca-trade-api";
+
+const res = await withResponse(alpaca.trading.account.getAccountRaw());
+res.data;                 // typed body
+res.status;               // 200
+res.headers.get("X-Request-ID");
+res.rateLimit?.remaining;
+```
+
+The response body is consumed once; use `res.data` instead of reading the raw
+body again.
+
+## Middleware observability
+
+The SDK provides logging and metrics middleware on top of the transport's
+`pre`/`post`/`onError` hooks. They observe each request attempt without changing
+its response, compose with retries, and isolate logger, metrics-sink, and
+request-ID-generator failures.
+
+```ts
+import { Alpaca, middleware } from "@alpacahq/alpaca-trade-api";
+
+const alpaca = new Alpaca({
+  keyId,
+  secret,
+  middleware: [
+    middleware.loggingMiddleware({
+      logger: console,
+      level: "info",
+    }),
+    middleware.metricsMiddleware({
+      onRequest: (metric) => {
+        statsd.timing("alpaca.request", metric.durationMs, {
+          method: metric.method,
+          status: metric.status,
+        });
+      },
+    }),
+  ],
+});
+```
+
+`loggingMiddleware` emits method, URL, status, duration, and a generated request
+ID for each attempt. Headers are omitted unless `logHeaders: true`; when
+included, `APCA-API-KEY-ID`, `APCA-API-SECRET-KEY`, and `Authorization` are
+redacted by default. Keep those defaults, or provide an equally strict
+`redactHeaders` list when extending them.
+
+Both built-in middleware accept `genRequestId: () => string` for your own
+correlation IDs. The default uses `crypto.randomUUID()` when available and a
+counter fallback otherwise. If a custom generator throws, the built-in
+generator is used so observability cannot fail the request.

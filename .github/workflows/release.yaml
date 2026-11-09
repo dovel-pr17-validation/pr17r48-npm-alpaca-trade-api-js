@@ -1,0 +1,50 @@
+name: Release
+
+on:
+  push:
+    branches:
+      - master
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  pull-requests: write
+  # Required for npm publish with provenance.
+  id-token: write
+
+jobs:
+  release:
+    name: Version or publish
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ">=24.22.1 <25"
+          check-latest: true
+          cache: npm
+          registry-url: https://registry.npmjs.org
+      - name: Install dependencies
+        run: npm ci
+      # When there are changesets, this opens/updates a "Version Packages" PR.
+      # When that PR is merged (no changesets left, versions bumped), it builds
+      # and publishes to the `latest` dist-tag via `npm run release`.
+      - name: Create release PR or publish
+        # Pinned to an immutable commit SHA (v2.1.1) — this workflow holds
+        # publish credentials, so a floating tag is a supply-chain risk.
+        uses: changesets/action@8488615a623b1b9c987934bb89eae8af6a946ac1 # v2.1.1
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          version-script: npm run changeset:version
+          publish-script: npm run release
+          commit-message: "chore: version packages"
+          pr-title: "chore: version packages"
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_KEY }}
+          NPM_TOKEN: ${{ secrets.NPM_KEY }}
+          NPM_CONFIG_PROVENANCE: "true"

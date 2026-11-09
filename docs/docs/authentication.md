@@ -1,0 +1,112 @@
+---
+sidebar_position: 3
+title: Authentication
+---
+
+# Authentication
+
+Alpaca authenticates with two distinct headers, `APCA-API-KEY-ID` and
+`APCA-API-SECRET-KEY`. The SDK maps these to a `keyId` / `secret` pair:
+
+```ts
+import { Alpaca } from "@alpacahq/alpaca-trade-api";
+
+const alpaca = new Alpaca({ keyId: "YOUR_KEY", secret: "YOUR_SECRET" });
+```
+
+:::warning Don't pass `apiKey` as a bare string
+A single string would be sent for **both** header values and Alpaca would reject
+it. Use the `keyId` / `secret` pair (or an OAuth token). The SDK throws a guided
+error if you pass `apiKey` as a string.
+:::
+
+When composing a low-level generated `Configuration`, use the exported helper
+to map the pair to the correct headers:
+
+```ts
+import { auth, trading } from "@alpacahq/alpaca-trade-api";
+
+const config = new trading.Configuration({
+  apiKey: auth.apiKeyAuth({ keyId, secret }),
+});
+```
+
+`apiKey` also accepts an asynchronous resolver when credentials need to be
+loaded or refreshed from an external secret store. Credential loading is
+covered by the configured `timeoutMs` and a per-request `AbortSignal`, so a
+stalled secret store does not leave the request pending indefinitely.
+
+## OAuth
+
+Provide an `accessToken` instead of a key pair to authenticate via OAuth (sent as
+the `Authorization: Bearer` header):
+
+```ts
+const alpaca = new Alpaca({ accessToken: "OAUTH_TOKEN" });
+```
+
+For expiring tokens, pass a provider. It is evaluated before every REST request
+and every fetch-based SSE connection or reconnect:
+
+```ts
+const alpaca = new Alpaca({
+  accessToken: async () => refreshOrLoadAccessToken(),
+});
+```
+
+OAuth also resolves from `APCA_API_OAUTH_TOKEN` when no explicit credential
+scheme is selected. Credential precedence is:
+
+1. A non-empty explicit `accessToken`.
+2. Any non-empty explicit `keyId` or `secret`, with only the missing key-pair
+   value read from `APCA_API_KEY_ID` or `APCA_API_SECRET_KEY`.
+3. Environment OAuth.
+4. An environment key pair.
+
+Empty explicit strings are treated as absent.
+
+Therefore, an unrelated process-level OAuth token cannot override an explicitly
+selected key account. OAuth remains available through either an explicit token
+or environment-only configuration. If both token and key fields are passed
+explicitly, the token wins.
+
+:::note Streaming authentication
+WebSocket streams require a key/secret pair and cannot use OAuth. Fetch-based
+SSE uses the same request authentication as REST: it accepts either a
+key/secret pair or OAuth, and a token provider is refreshed before reconnects.
+:::
+
+## Verifying credentials
+
+`trading.validateConnection()` checks credentials and connectivity without
+throwing. It performs a lightweight authenticated probe (`getAccount`) and
+returns a discriminated result: `{ ok: true, account }` on success, or
+`{ ok: false, status, code, message }` on failure (a `401`/`403` for bad or
+unauthorized credentials sets `status`; transport failures surface the
+underlying `message`). Handy for a startup health check.
+
+```ts
+const check = await alpaca.trading.validateConnection();
+if (!check.ok) {
+  throw new Error(`Alpaca auth failed (${check.status ?? "network"}): ${check.message}`);
+}
+console.log("connected as", check.account.id);
+```
+
+## Paper vs live vs sandbox
+
+- **`paper`** (default `true`) selects the paper trading host; set `paper: false`
+  for live trading. Honored only by hosts that distinguish the two (e.g. trading).
+- **`sandbox`** selects the market-data sandbox host where supported. Crypto and
+  news streams are **production-only** (no sandbox endpoint).
+- **`basePath`** applies only to a low-level generated `Configuration`, where it
+  overrides that configuration's host. It is not an `Alpaca` facade option;
+  select facade hosts with `paper`, `sandbox`, or a stream's `url` option.
+
+```ts
+const live = new Alpaca({ keyId, secret, paper: false });
+```
+
+The REST host constants are exported for integrations that need to construct or
+validate URLs directly: `trading.TRADING_PAPER_HOST`,
+`trading.TRADING_LIVE_HOST`, and `marketData.MARKET_DATA_HOST`.
